@@ -1,0 +1,725 @@
+"use client";
+
+import { useState } from "react";
+import { motion, AnimatePresence } from "framer-motion";
+import { Lock, Unlock, Key, Download, Upload, Shield, Layers } from "lucide-react";
+import { EncryptionManager } from "@/lib/crypto/encryption-manager";
+import { CipherAlgorithm, SecurityMode, EncryptionLayer } from "@/lib/crypto/types";
+import { cn, formatTime, formatBytes } from "@/lib/utils";
+import { EncryptionFlow } from "./encryption-flow";
+import { KeyGenerationInfo } from "./key-generation-info";
+
+const encryptionManager = new EncryptionManager();
+
+interface EncryptionPanelProps {
+  onPerformanceUpdate?: (metrics: any) => void;
+  onHistoryAdd?: (entry: any) => void;
+}
+
+export function EncryptionPanel({ onPerformanceUpdate, onHistoryAdd }: EncryptionPanelProps) {
+  const [mode, setMode] = useState<"encrypt" | "decrypt">("encrypt");
+  const [securityMode, setSecurityMode] = useState<SecurityMode>("balanced");
+  const [plaintext, setPlaintext] = useState("");
+  const [ciphertext, setCiphertext] = useState("");
+  const [keys, setKeys] = useState<Record<string, string>>({});
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [isGeneratingKeys, setIsGeneratingKeys] = useState(false);
+  const [result, setResult] = useState("");
+  const [layers, setLayers] = useState<EncryptionLayer[]>([]);
+  const [showLayerInfo, setShowLayerInfo] = useState(true);
+  const [isSecurityModeLocked, setIsSecurityModeLocked] = useState(false);
+
+  const securityModes: { value: SecurityMode; label: string; description: string; layers: number }[] = [
+    { value: "high", label: "High Security", description: "5 layers - Maximum protection", layers: 5 },
+    { value: "balanced", label: "Balanced", description: "3 layers - Optimal performance", layers: 3 },
+    { value: "lightweight", label: "Lightweight", description: "2 layers - Fast encryption", layers: 2 },
+  ];
+
+  // Get recommended algorithms for current security mode
+  const selectedAlgorithms = encryptionManager.getRecommendedAlgorithms(securityMode);
+
+  const generateKeys = async () => {
+    setIsGeneratingKeys(true);
+    try {
+      const newKeys: Record<string, string> = {};
+
+      // Generate keys one by one to show progress (RSA can be slow)
+      for (const algorithm of selectedAlgorithms) {
+        try {
+          newKeys[algorithm] = await encryptionManager.generateKey(algorithm, securityMode);
+          // Small delay to allow UI updates
+          await new Promise(resolve => setTimeout(resolve, 50));
+        } catch (error) {
+          console.error(`Failed to generate ${algorithm} key:`, error);
+          throw new Error(`Failed to generate ${algorithm.toUpperCase()} key: ${error}`);
+        }
+      }
+
+      // Verify all keys were generated
+      const missingKeys = selectedAlgorithms.filter(algo => !newKeys[algo]);
+      if (missingKeys.length > 0) {
+        throw new Error(`Some keys failed to generate: ${missingKeys.join(", ").toUpperCase()}`);
+      }
+
+      setKeys(newKeys);
+      setIsSecurityModeLocked(true); // Lock security mode after keys are generated
+
+      // Show success message
+      const keyCount = Object.keys(newKeys).length;
+      console.log(`✅ Successfully generated ${keyCount} keys for ${securityMode} mode`);
+    } catch (error) {
+      console.error("Key generation failed:", error);
+      alert(`❌ Key generation failed!\n\n${error}\n\nPlease try again.`);
+      // Clear partial keys
+      setKeys({});
+    } finally {
+      setIsGeneratingKeys(false);
+    }
+  };
+
+  const handleEncrypt = async () => {
+    if (!plaintext.trim()) {
+      alert("Please enter text to encrypt");
+      return;
+    }
+
+    if (Object.keys(keys).length === 0) {
+      alert("Please generate encryption keys first");
+      return;
+    }
+
+    // Verify all required keys exist
+    const missingKeys = selectedAlgorithms.filter(algo => !keys[algo]);
+    if (missingKeys.length > 0) {
+      alert(
+        `❌ Missing keys for: ${missingKeys.join(", ").toUpperCase()}\n\n` +
+        `Current mode requires ${selectedAlgorithms.length} keys, but only ${Object.keys(keys).length} found.\n\n` +
+        `Click "Clear" and regenerate all keys.`
+      );
+      return;
+    }
+
+    setIsProcessing(true);
+    try {
+      // Pass existing keys to encryption manager
+      const result = await encryptionManager.multiLayerEncrypt(
+        plaintext,
+        selectedAlgorithms,
+        securityMode,
+        keys // Use pre-generated keys if they exist
+      );
+
+      setCiphertext(result.encrypted);
+      setResult(result.encrypted);
+      setLayers(result.layers);
+      // Update keys with the ones used (in case any were newly generated)
+      setKeys(result.keys);
+
+      // Calculate combined metrics
+      const totalTime = result.metrics.reduce((sum, m) => sum + m.encryptionTime, 0);
+      const maxMemory = Math.max(...result.metrics.map((m) => m.memoryUsed));
+      const avgThroughput =
+        result.metrics.reduce((sum, m) => sum + m.throughput, 0) / result.metrics.length;
+
+      const combinedMetrics = {
+        encryptionTime: totalTime,
+        memoryUsed: maxMemory,
+        dataSize: new Blob([plaintext]).size,
+        throughput: avgThroughput,
+      };
+
+      if (onPerformanceUpdate) {
+        onPerformanceUpdate(combinedMetrics);
+      }
+
+      if (onHistoryAdd) {
+        onHistoryAdd({
+          id: Date.now().toString(),
+          type: "encrypt",
+          algorithm: selectedAlgorithms[0], // Primary algorithm
+          timestamp: Date.now(),
+          inputSize: new Blob([plaintext]).size,
+          metrics: combinedMetrics,
+          success: true,
+          layers: result.layers,
+        });
+      }
+    } catch (error) {
+      console.error("Encryption failed:", error);
+      alert(`Encryption failed: ${error}`);
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  const handleDecrypt = async () => {
+    if (!ciphertext.trim()) {
+      alert("Please enter text to decrypt");
+      return;
+    }
+
+    if (Object.keys(keys).length === 0) {
+      alert("❌ No decryption keys found!\n\nPlease generate keys first or use the same keys from encryption.");
+      return;
+    }
+
+    // Check if all required keys exist
+    const missingKeys = selectedAlgorithms.filter(algo => !keys[algo] || keys[algo].trim() === "");
+    if (missingKeys.length > 0) {
+      alert(
+        `❌ Missing keys for: ${missingKeys.join(", ").toUpperCase()}\n\n` +
+        `Security mode: ${securityMode.toUpperCase()}\n` +
+        `Required: ${selectedAlgorithms.length} keys\n` +
+        `Found: ${Object.keys(keys).length} keys\n\n` +
+        `💡 Solution:\n` +
+        `1. Make sure you're using the SAME security mode as encryption\n` +
+        `2. Or click "Clear" and start fresh with matching mode\n` +
+        `3. Generate keys → Encrypt → Decrypt (same mode)`
+      );
+      return;
+    }
+
+    console.log(`🔓 Decrypting with ${securityMode} mode (${selectedAlgorithms.length} layers)...`);
+
+    setIsProcessing(true);
+    try {
+      const result = await encryptionManager.multiLayerDecrypt(
+        ciphertext,
+        selectedAlgorithms,
+        keys,
+        securityMode
+      );
+
+      setPlaintext(result.decrypted);
+      setResult(result.decrypted);
+      setLayers(result.layers);
+
+      // Calculate combined metrics
+      const totalTime = result.metrics.reduce((sum, m) => sum + m.encryptionTime, 0);
+      const maxMemory = Math.max(...result.metrics.map((m) => m.memoryUsed));
+      const avgThroughput =
+        result.metrics.reduce((sum, m) => sum + m.throughput, 0) / result.metrics.length;
+
+      const combinedMetrics = {
+        encryptionTime: totalTime,
+        memoryUsed: maxMemory,
+        dataSize: new Blob([ciphertext]).size,
+        throughput: avgThroughput,
+      };
+
+      if (onPerformanceUpdate) {
+        onPerformanceUpdate(combinedMetrics);
+      }
+
+      if (onHistoryAdd) {
+        onHistoryAdd({
+          id: Date.now().toString(),
+          type: "decrypt",
+          algorithm: selectedAlgorithms[0], // Primary algorithm
+          timestamp: Date.now(),
+          inputSize: new Blob([ciphertext]).size,
+          metrics: combinedMetrics,
+          success: true,
+          layers: result.layers,
+        });
+      }
+    } catch (error) {
+      console.error("❌ Decryption failed:", error);
+      const errorMsg = error instanceof Error ? error.message : String(error);
+
+      // Show helpful message - the error already contains detailed info from encryption-manager
+      alert(`${errorMsg}`);
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  const downloadResult = () => {
+    const blob = new Blob([result], { type: "text/plain" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${mode}-result-${Date.now()}.txt`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const downloadKeys = () => {
+    // Create JSON structure with metadata
+    const keyExport = {
+      securityMode: securityMode,
+      timestamp: Date.now(),
+      algorithms: selectedAlgorithms,
+      keys: keys,
+      version: "1.0"
+    };
+
+    const jsonString = JSON.stringify(keyExport, null, 2);
+    const blob = new Blob([jsonString], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `encryption-keys-${securityMode}-${Date.now()}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+
+    console.log(`✅ Keys saved for ${securityMode} mode with ${selectedAlgorithms.length} algorithms`);
+  };
+
+  const loadKeys = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    // Check file extension
+    if (!file.name.endsWith('.json')) {
+      alert("❌ Invalid file type!\n\nPlease upload a .json key file.");
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const content = e.target?.result as string;
+        const keyData = JSON.parse(content);
+
+        // Validate JSON structure
+        if (!keyData.securityMode || !keyData.algorithms || !keyData.keys) {
+          throw new Error("Invalid key file format");
+        }
+
+        // Check if security mode matches
+        if (keyData.securityMode !== securityMode) {
+          const switchMode = confirm(
+            `⚠️ Security Mode Mismatch!\n\n` +
+            `Key file is for: ${keyData.securityMode.toUpperCase()} mode\n` +
+            `Current mode: ${securityMode.toUpperCase()}\n\n` +
+            `Click OK to switch to ${keyData.securityMode.toUpperCase()} mode, or Cancel to keep current mode.`
+          );
+
+          if (switchMode) {
+            setSecurityMode(keyData.securityMode);
+          } else {
+            return;
+          }
+        }
+
+        // Validate all required keys are present
+        const requiredAlgorithms = encryptionManager.getRecommendedAlgorithms(keyData.securityMode);
+        const missingKeys = requiredAlgorithms.filter(algo => !keyData.keys[algo]);
+
+        if (missingKeys.length > 0) {
+          alert(
+            `❌ Incomplete key file!\n\n` +
+            `Missing keys for: ${missingKeys.join(", ").toUpperCase()}\n\n` +
+            `This file is corrupted or incomplete. Please use a valid key file.`
+          );
+          return;
+        }
+
+        // Load keys into state
+        setKeys(keyData.keys);
+        setIsSecurityModeLocked(true);
+
+        console.log(`✅ Loaded ${Object.keys(keyData.keys).length} keys for ${keyData.securityMode} mode`);
+        alert(
+          `✅ Keys Loaded Successfully!\n\n` +
+          `Mode: ${keyData.securityMode.toUpperCase()}\n` +
+          `Algorithms: ${Object.keys(keyData.keys).length}\n\n` +
+          `You can now decrypt your message.`
+        );
+
+      } catch (error) {
+        console.error("Failed to load keys:", error);
+        alert(
+          `❌ Failed to load key file!\n\n` +
+          `Error: ${error instanceof Error ? error.message : "Invalid JSON file"}\n\n` +
+          `Please make sure you're using a valid encryption key file.`
+        );
+      }
+    };
+
+    reader.readAsText(file);
+
+    // Reset file input so same file can be selected again
+    event.target.value = '';
+  };
+
+  return (
+    <div className="w-full max-w-6xl mx-auto space-y-6">
+      {/* Mode Selector */}
+      <div className="flex gap-3 sm:gap-4 justify-center flex-wrap">
+        <motion.button
+          whileHover={{ scale: 1.05 }}
+          whileTap={{ scale: 0.95 }}
+          onClick={() => {
+            setMode("encrypt");
+            setResult("");
+          }}
+          className={cn(
+            "flex-1 sm:flex-none px-6 sm:px-8 py-3 rounded-xl font-semibold flex items-center justify-center gap-2 transition-all",
+            mode === "encrypt"
+              ? "bg-gradient-to-r from-indigo-600 to-purple-600 text-white shadow-lg"
+              : "bg-white hover:bg-indigo-50 text-gray-900 font-semibold border-2 border-indigo-200 hover:border-indigo-400"
+          )}
+        >
+          <Lock className="w-5 h-5" />
+          Encrypt
+        </motion.button>
+        <motion.button
+          whileHover={{ scale: 1.05 }}
+          whileTap={{ scale: 0.95 }}
+          onClick={() => {
+            setMode("decrypt");
+            setResult("");
+          }}
+          className={cn(
+            "flex-1 sm:flex-none px-6 sm:px-8 py-3 rounded-xl font-semibold flex items-center justify-center gap-2 transition-all",
+            mode === "decrypt"
+              ? "bg-gradient-to-r from-purple-600 to-pink-600 text-white shadow-lg"
+              : "bg-white hover:bg-purple-50 text-gray-900 font-semibold border-2 border-purple-200 hover:border-purple-400"
+          )}
+        >
+          <Unlock className="w-5 h-5" />
+          Decrypt
+        </motion.button>
+      </div>
+
+      {/* Security Mode Selection */}
+      <motion.div
+        initial={{ opacity: 0, y: 20 }}
+        animate={{ opacity: 1, y: 0 }}
+        className="glass rounded-2xl p-6 shadow-xl"
+      >
+        <h3 className="text-lg font-bold mb-4 flex items-center gap-2 text-gray-900">
+          <Shield className="w-5 h-5 text-indigo-600" />
+          Security Mode (Auto-selects encryption layers)
+        </h3>
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+          {securityModes.map((sm) => (
+            <motion.button
+              key={sm.value}
+              whileHover={{ scale: isSecurityModeLocked ? 1 : 1.02 }}
+              whileTap={{ scale: isSecurityModeLocked ? 1 : 0.98 }}
+              onClick={() => {
+                if (!isSecurityModeLocked) {
+                  setSecurityMode(sm.value);
+                  setKeys({}); // Clear keys when mode changes
+                  setLayers([]); // Clear layers
+                }
+              }}
+              disabled={isSecurityModeLocked}
+              className={cn(
+                "p-5 rounded-xl text-left transition-all relative overflow-hidden",
+                isSecurityModeLocked && "opacity-60 cursor-not-allowed",
+                securityMode === sm.value
+                  ? "bg-gradient-to-r from-pink-500 to-rose-500 text-white shadow-lg"
+                  : "bg-white hover:bg-pink-50 text-gray-900 font-bold border-2 border-pink-200 hover:border-pink-400"
+              )}
+            >
+              <div className="relative z-10">
+                <div className="flex items-center justify-between mb-2">
+                  <div className="font-bold text-lg">{sm.label}</div>
+                  <div
+                    className={cn(
+                      "px-2 py-1 rounded-lg text-xs font-bold",
+                      securityMode === sm.value
+                        ? "bg-white/20 text-white"
+                        : "bg-pink-100 text-pink-700"
+                    )}
+                  >
+                    {sm.layers} Layers
+                  </div>
+                </div>
+                <div className={cn("text-sm mt-1", securityMode === sm.value ? "opacity-90" : "opacity-70")}>
+                  {sm.description}
+                </div>
+              </div>
+            </motion.button>
+          ))}
+        </div>
+        {isSecurityModeLocked && (
+          <div className="mt-4 p-3 bg-yellow-50 border-2 border-yellow-300 rounded-xl">
+            <p className="text-sm text-yellow-800 font-semibold">
+              🔒 Security mode is locked. Clear keys to change mode.
+            </p>
+          </div>
+        )}
+      </motion.div>
+
+      {/* Selected Algorithms Display */}
+      <motion.div
+        initial={{ opacity: 0, y: 20 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ delay: 0.1 }}
+        className="glass rounded-2xl p-6 shadow-xl"
+      >
+        <h3 className="text-lg font-bold mb-4 flex items-center gap-2 text-gray-900">
+          <Layers className="w-5 h-5 text-purple-600" />
+          Encryption Layers ({selectedAlgorithms.length} algorithms)
+        </h3>
+        <div className="flex flex-wrap gap-3">
+          {selectedAlgorithms.map((algo, index) => (
+            <motion.div
+              key={algo}
+              initial={{ opacity: 0, scale: 0.8 }}
+              animate={{ opacity: 1, scale: 1 }}
+              transition={{ delay: index * 0.1 }}
+              className="px-4 py-2 bg-gradient-to-r from-indigo-500 to-purple-500 text-white rounded-xl font-bold shadow-md flex items-center gap-2"
+            >
+              <span className="text-xs bg-white/20 px-2 py-0.5 rounded-full">{index + 1}</span>
+              {algo.toUpperCase()}
+            </motion.div>
+          ))}
+        </div>
+        <p className="mt-3 text-sm text-gray-600">
+          Your data will be encrypted sequentially through {selectedAlgorithms.length} layers for{" "}
+          <span className="font-bold text-indigo-600">{securityMode}</span> security.
+        </p>
+      </motion.div>
+
+      {/* Key Generation Info Toggle */}
+      {selectedAlgorithms.length > 0 && (
+        <div className="flex justify-center">
+          <motion.button
+            whileHover={{ scale: 1.05 }}
+            whileTap={{ scale: 0.95 }}
+            onClick={() => setShowLayerInfo(!showLayerInfo)}
+            className="px-6 py-2 rounded-xl bg-white border-2 border-indigo-300 text-gray-900 font-semibold hover:bg-indigo-50 transition-all"
+          >
+            {showLayerInfo ? "Hide" : "Show"} Key Generation Details
+          </motion.button>
+        </div>
+      )}
+
+      {/* Key Generation Info */}
+      <AnimatePresence>
+        {showLayerInfo && selectedAlgorithms.length > 0 && (
+          <motion.div
+            initial={{ opacity: 0, height: 0 }}
+            animate={{ opacity: 1, height: "auto" }}
+            exit={{ opacity: 0, height: 0 }}
+            transition={{ duration: 0.3 }}
+          >
+            <KeyGenerationInfo algorithms={selectedAlgorithms} securityMode={securityMode} />
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Input/Output Area */}
+      <motion.div
+        initial={{ opacity: 0, y: 20 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ delay: 0.2 }}
+        className="glass rounded-2xl p-6 shadow-xl"
+      >
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+          {/* Input */}
+          <div className="space-y-3">
+            <label className="block font-bold text-gray-900">
+              {mode === "encrypt" ? "Plaintext" : "Ciphertext"}
+            </label>
+            <textarea
+              value={mode === "encrypt" ? plaintext : ciphertext}
+              onChange={(e) =>
+                mode === "encrypt" ? setPlaintext(e.target.value) : setCiphertext(e.target.value)
+              }
+              placeholder={`Enter ${mode === "encrypt" ? "text to encrypt" : "text to decrypt"}...`}
+              className="w-full h-40 p-4 rounded-xl bg-white text-gray-900 border-2 border-indigo-300 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 resize-none shadow-md"
+            />
+          </div>
+
+          {/* Output */}
+          <div className="space-y-3">
+            <label className="block font-bold text-gray-900">
+              {mode === "encrypt" ? "Ciphertext" : "Plaintext"}
+            </label>
+            <textarea
+              value={result}
+              readOnly
+              placeholder="Result will appear here..."
+              className="w-full h-40 p-4 rounded-xl bg-gray-50 text-gray-900 border-2 border-purple-300 resize-none shadow-md"
+            />
+          </div>
+        </div>
+
+        {/* Keys Display */}
+        <div className="mt-6 space-y-3">
+          <label className="block font-bold flex items-center gap-2 text-gray-900">
+            <Key className="w-5 h-5 text-amber-600" />
+            Encryption Keys ({selectedAlgorithms.length} keys)
+          </label>
+
+          {Object.keys(keys).length > 0 ? (
+            <div className="space-y-2 max-h-40 overflow-y-auto p-3 bg-gray-50 rounded-xl border-2 border-indigo-200">
+              {selectedAlgorithms.map((algo) => (
+                <div key={algo} className="p-2 bg-white rounded-lg border border-gray-200">
+                  <div className="text-xs font-bold text-indigo-600 uppercase mb-1">{algo}</div>
+                  <code className="text-xs text-gray-700 font-mono break-all">
+                    {keys[algo] || "Not generated"}
+                  </code>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="p-4 bg-amber-50 rounded-xl border-2 border-amber-200 text-center">
+              <p className="text-sm font-semibold text-amber-800">⚠️ No keys generated yet!</p>
+              <p className="text-xs text-amber-700 mt-1">Click "Generate Keys" below before encrypting.</p>
+            </div>
+          )}
+
+          {mode === "encrypt" && Object.keys(keys).length > 0 && (
+            <div className="p-3 bg-green-50 border-2 border-green-300 rounded-xl">
+              <p className="text-sm text-green-800 font-semibold">
+                ✅ Keys ready! You can now encrypt. These keys will be used for encryption.
+              </p>
+            </div>
+          )}
+
+          <div className="flex flex-wrap gap-3">
+            <motion.button
+              whileHover={{ scale: isGeneratingKeys ? 1 : 1.05 }}
+              whileTap={{ scale: isGeneratingKeys ? 1 : 0.95 }}
+              onClick={generateKeys}
+              disabled={isGeneratingKeys}
+              className={cn(
+                "w-full sm:flex-1 px-6 py-4 rounded-xl font-semibold shadow-lg transition-all",
+                isGeneratingKeys
+                  ? "bg-gray-400 cursor-not-allowed"
+                  : "bg-gradient-to-r from-amber-500 to-orange-500 text-white hover:shadow-xl hover:from-amber-600 hover:to-orange-600"
+              )}
+            >
+              {isGeneratingKeys ? (
+                <span className="flex items-center gap-2 justify-center">
+                  <div className="w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                  Generating Keys...
+                </span>
+              ) : (
+                "Generate Keys"
+              )}
+            </motion.button>
+
+            {/* Load Keys button - always show in decrypt mode */}
+            {mode === "decrypt" && !isGeneratingKeys && (
+              <motion.div
+                initial={{ opacity: 0, scale: 0.8 }}
+                animate={{ opacity: 1, scale: 1 }}
+                className="w-full"
+              >
+                <input
+                  type="file"
+                  id="load-keys-input"
+                  accept=".json,application/json"
+                  onChange={loadKeys}
+                  className="hidden"
+                />
+                <motion.label
+                  htmlFor="load-keys-input"
+                  whileHover={{ scale: 1.05 }}
+                  whileTap={{ scale: 0.95 }}
+                  className="w-full sm:flex-1 px-6 py-4 rounded-xl bg-gradient-to-r from-green-500 to-emerald-500 text-white font-semibold shadow-lg hover:shadow-xl transition-all flex items-center gap-2 justify-center cursor-pointer"
+                >
+                  <Upload className="w-5 h-5" />
+                  Load Keys
+                </motion.label>
+                <div className="mt-2 p-2 bg-blue-50 border border-blue-200 rounded-lg">
+                  <p className="text-xs text-blue-800 font-medium">
+                    ⚠️ Keys must match the ones used for encryption. Check browser console (F12) for detailed decryption logs.
+                  </p>
+                </div>
+              </motion.div>
+            )}
+
+            {Object.keys(keys).length > 0 && (
+              <>
+                <motion.button
+                  initial={{ opacity: 0, scale: 0.8 }}
+                  animate={{ opacity: 1, scale: 1 }}
+                  whileHover={{ scale: 1.05 }}
+                  whileTap={{ scale: 0.95 }}
+                  onClick={downloadKeys}
+                  className="w-full sm:w-auto px-6 py-4 rounded-xl bg-gradient-to-r from-blue-500 to-cyan-500 text-white font-semibold shadow-lg hover:shadow-xl transition-all flex items-center gap-2 justify-center"
+                >
+                  <Download className="w-5 h-5" />
+                  Save Keys
+                </motion.button>
+                <motion.button
+                  initial={{ opacity: 0, scale: 0.8 }}
+                  animate={{ opacity: 1, scale: 1 }}
+                  whileHover={{ scale: 1.05 }}
+                  whileTap={{ scale: 0.95 }}
+                  onClick={() => {
+                    setKeys({});
+                    setLayers([]);
+                    setIsSecurityModeLocked(false);
+                    setResult("");
+                    setPlaintext("");
+                    setCiphertext("");
+                  }}
+                  className="w-full sm:w-auto px-6 py-4 rounded-xl bg-gradient-to-r from-red-500 to-rose-500 text-white font-semibold shadow-lg hover:shadow-xl transition-all justify-center flex items-center gap-2"
+                >
+                  Clear
+                </motion.button>
+              </>
+            )}
+          </div>
+        </div>
+
+        {/* Action Buttons */}
+        <div className="mt-6 flex gap-4 justify-center flex-wrap">
+          <motion.button
+            whileHover={{ scale: 1.05 }}
+            whileTap={{ scale: 0.95 }}
+            onClick={mode === "encrypt" ? handleEncrypt : handleDecrypt}
+            disabled={isProcessing}
+            className={cn(
+              "w-full sm:w-auto px-8 py-4 rounded-xl font-bold text-lg shadow-lg transition-all",
+              isProcessing
+                ? "bg-gray-400 cursor-not-allowed"
+                : "bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-700 hover:to-purple-700 text-white shadow-xl"
+            )}
+          >
+            {isProcessing ? (
+              <span className="flex items-center gap-2 justify-center">
+                <div className="w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                Processing...
+              </span>
+            ) : (
+              <span className="flex items-center gap-2 justify-center">
+                {mode === "encrypt" ? <Lock className="w-5 h-5" /> : <Unlock className="w-5 h-5" />}
+                {mode === "encrypt" ? "Encrypt" : "Decrypt"}
+              </span>
+            )}
+          </motion.button>
+
+          {result && (
+            <motion.button
+              initial={{ opacity: 0, scale: 0.8 }}
+              animate={{ opacity: 1, scale: 1 }}
+              whileHover={{ scale: 1.05 }}
+              whileTap={{ scale: 0.95 }}
+              onClick={downloadResult}
+              className="w-full sm:w-auto px-6 py-4 rounded-xl bg-gradient-to-r from-green-500 to-emerald-500 text-white font-semibold shadow-lg hover:shadow-xl hover:from-green-600 hover:to-emerald-600 transition-all flex items-center gap-2 justify-center"
+            >
+              <Download className="w-5 h-5" />
+              Download Result
+            </motion.button>
+          )}
+        </div>
+      </motion.div>
+
+      {/* Encryption Flow Visualization */}
+      <AnimatePresence>
+        {layers.length > 0 && (
+          <motion.div
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -20 }}
+            transition={{ delay: 0.3 }}
+          >
+            <EncryptionFlow layers={layers} isEncrypting={mode === "encrypt"} />
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
+  );
+}
