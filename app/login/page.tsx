@@ -2,7 +2,7 @@
 
 import { useState } from 'react';
 import { useRouter } from 'next/navigation';
-import { useAuth } from '@/lib/auth-context';
+import { login as loginWithMockAuth, setToken } from '@/lib/auth';
 
 export default function LoginPage() {
   const [email, setEmail] = useState('');
@@ -10,15 +10,14 @@ export default function LoginPage() {
   const [error, setError] = useState('');
   const router = useRouter();
 
-  const { login } = useAuth();
-
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
 
     try {
-      await login({ email, password });
-      router.push('/'); // Redirect to home page after successful login
+      const response = await loginWithMockAuth({ email, password });
+      setToken(response.token);
+      router.push('/');
     } catch (err) {
       setError('Invalid email or password');
     }
